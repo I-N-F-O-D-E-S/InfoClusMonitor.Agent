@@ -1,0 +1,62 @@
+==============================================================================
+         INFODESCLUSTER - GUÍA RÁPIDA DE INSTALACIÓN DEL AGENTE
+==============================================================================
+
+Solo necesitas 2 archivos en tu servidor Linux:
+  1. agent.py
+  2. install.sh
+
+------------------------------------------------------------------------------
+PASO 1: SUBIR LOS ARCHIVOS POR WINSCP
+------------------------------------------------------------------------------
+1. Abre WinSCP y conéctate a tu servidor Linux por SFTP/SSH (puerto 22).
+2. Entra a cualquier carpeta (ejemplo: /root o /home/tu_usuario).
+3. Arrastra y suelta estos 2 archivos:
+   - agent.py
+   - install.sh
+
+------------------------------------------------------------------------------
+PASO 2: EJECUTAR EL INSTALADOR EN LA TERMINAL SSH
+------------------------------------------------------------------------------
+Abre la consola SSH (PuTTY o terminal de tu preferencia) en esa carpeta y ejecuta:
+
+    sudo bash install.sh
+
+¡Y listo! El script se encarga de todo automáticamente:
+  - Instala Python 3 y dependencias.
+  - Configura el entorno en /opt/infodescluster-agent.
+  - Registra el servicio de sistema (Systemd).
+  - Deja el agente corriendo en segundo plano y activo al reiniciar el servidor.
+
+------------------------------------------------------------------------------
+PASO 3: COMANDOS ÚTILES PARA ADMINISTRAR EL SERVICIO
+------------------------------------------------------------------------------
+
+* Ver el estado en vivo:
+    sudo systemctl status infodescluster-agent
+
+* Ver logs de telemetría y comandos en tiempo real:
+    sudo journalctl -u infodescluster-agent -f
+
+* Reiniciar el agente:
+    sudo systemctl restart infodescluster-agent
+
+* Detener el agente:
+    sudo systemctl stop infodescluster-agent
+
+* Desinstalar el agente completamente:
+    sudo systemctl stop infodescluster-agent
+    sudo systemctl disable infodescluster-agent
+    sudo rm -f /etc/systemd/system/infodescluster-agent.service
+    sudo systemctl daemon-reload
+    sudo rm -rf /opt/infodescluster-agent
+
+------------------------------------------------------------------------------
+PASO 4: ACCESO AL PANEL WEB (INFODESCLUSTER)
+------------------------------------------------------------------------------
+Abre tu navegador web en la dirección de tu frontend y accede con:
+  - Usuario:     admin
+  - Contraseña:  admin123
+
+Tu servidor aparecerá automáticamente en la lista de nodos en línea.
+==============================================================================

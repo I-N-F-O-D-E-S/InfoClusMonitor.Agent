@@ -2,7 +2,7 @@
 set -e
 
 # ==============================================================================
-# InfodesCluster Agent - Instalador Limpio y Gestor de Servicio Systemd
+# BuhoControl Agent - Instalador Limpio y Gestor de Servicio Systemd
 # ==============================================================================
 
 INSTALL_DIR="/opt/infodescluster-agent"
@@ -10,7 +10,7 @@ SERVICE_NAME="infodescluster-agent"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 echo "=========================================================="
-echo "    Instalador / Actualizador InfodesCluster (Linux)"
+echo "    Instalador / Actualizador BuhoControl (Linux)"
 echo "=========================================================="
 
 # 1. Verificar permisos de root
@@ -19,48 +19,36 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "[1/6] Deteniendo y limpiando versiones anteriores..."
-# Detener y deshabilitar servicios anteriores si existen
-systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
-systemctl disable "${SERVICE_NAME}" 2>/dev/null || true
-systemctl stop infoclus-agent 2>/dev/null || true
-systemctl disable infoclus-agent 2>/dev/null || true
+mkdir -p "${INSTALL_DIR}"
 
-# Matar procesos residuales de agent.py si hubieran quedado colgados
-pkill -f "python.*agent.py" 2>/dev/null || true
-
-# Limpiar directorio de instalación previo pero conservando el agent_id si ya existía
+# Preservar o configurar agent_id
 AGENT_ID=""
 if [ -f "/root/.infoclus_agent_id" ]; then
     AGENT_ID=$(cat "/root/.infoclus_agent_id")
 fi
 
-rm -rf "${INSTALL_DIR}"
-mkdir -p "${INSTALL_DIR}"
+echo "[1/4] Verificando dependencias del sistema y Python..."
+if [ ! -d "${INSTALL_DIR}/venv" ]; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq python3 python3-pip python3-venv curl
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3 python3-pip curl
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3 python3-pip curl
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm python python-pip curl
+    fi
 
-if [ -n "$AGENT_ID" ]; then
-    echo "$AGENT_ID" > "/root/.infoclus_agent_id"
+    echo "[2/4] Creando entorno virtual Python limpio..."
+    python3 -m venv "${INSTALL_DIR}/venv"
+    "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
+    "${INSTALL_DIR}/venv/bin/pip" install pika psutil -q
+else
+    echo "[2/4] Entorno virtual ya configurado."
 fi
 
-echo "[2/6] Verificando e instalando dependencias del sistema..."
-if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y -qq python3 python3-pip python3-venv curl
-elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y python3 python3-pip curl
-elif command -v yum >/dev/null 2>&1; then
-    yum install -y python3 python3-pip curl
-elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm python python-pip curl
-fi
-
-echo "[3/6] Creando entorno virtual Python limpio e instalando librerías..."
-python3 -m venv "${INSTALL_DIR}/venv"
-"${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
-"${INSTALL_DIR}/venv/bin/pip" install pika psutil -q
-
-echo "[4/6] Instalando script actualizado del agente..."
-# Copiar agent.py desde el directorio actual o donde se encuentre el script
+echo "[3/4] Instalando script actualizado del agente..."
 if [ -f "agent.py" ]; then
     cp agent.py "${INSTALL_DIR}/agent.py"
 elif [ -f "$(dirname "$0")/agent.py" ]; then
@@ -72,8 +60,9 @@ fi
 
 chmod +x "${INSTALL_DIR}/agent.py"
 
-echo "[5/6] Configurando nuevo servicio systemd..."
-cat << 'EOF' > "${SERVICE_FILE}"
+echo "[4/4] Verificando servicio systemd..."
+if [ ! -f "${SERVICE_FILE}" ]; then
+    cat << 'EOF' > "${SERVICE_FILE}"
 [Unit]
 Description=InfodesCluster Linux Telemetry and Remote Execution Agent
 After=network-online.target
@@ -97,24 +86,13 @@ Environment="HEARTBEAT_INTERVAL=15"
 [Install]
 WantedBy=multi-user.target
 EOF
-
-echo "[6/6] Recargando e iniciando servicio..."
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}"
-systemctl restart "${SERVICE_NAME}"
-
-# Esperar 2 segundos para verificar que arrancó correctamente
-sleep 2
-
-if systemctl is-active --quiet "${SERVICE_NAME}"; then
-    echo "=========================================================="
-    echo " [✓] ¡Agente InfodesCluster ACTUALIZADO y corriendo!"
-    echo "=========================================================="
-    echo " - Estado: ACTIVO (Running)"
-    echo " - Comandos útiles:"
-    echo "     systemctl status ${SERVICE_NAME}"
-    echo "     journalctl -u ${SERVICE_NAME} -f"
-    echo "=========================================================="
-else
-    echo "[!] El servicio no pudo iniciar. Revisa los logs con: journalctl -u ${SERVICE_NAME} -e"
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}"
 fi
+
+echo "[✓] Reiniciando servicio en segundo plano..."
+(sleep 1 && systemctl restart "${SERVICE_NAME}") >/dev/null 2>&1 &
+
+echo "=========================================================="
+echo " [✓] ¡Agente BuhoControl ACTUALIZADO exitosamente!"
+echo "=========================================================="

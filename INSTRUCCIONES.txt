@@ -7,7 +7,16 @@ Solo necesitas 2 archivos en tu servidor Linux:
   2. install.sh
 
 ------------------------------------------------------------------------------
-PASO 1: SUBIR LOS ARCHIVOS POR WINSCP
+MÉTODO 1: INSTALACIÓN RÁPIDA EN 1 LÍNEA (RECOMENDADO - DIRECTO DESDE MINIO)
+------------------------------------------------------------------------------
+Copia y pega este comando en la terminal SSH de tu servidor Linux como root/sudo:
+
+    mkdir -p /tmp/infoclus_agent_pkg && cd /tmp/infoclus_agent_pkg && curl -fsSL 'https://storageapi.mrapy.com/infoclus-releases/agent-package.tar.gz' -o package.tar.gz && tar -xzf package.tar.gz && chmod +x install.sh agent.py && sudo bash install.sh
+
+¡Y listo! Descarga el paquete completo de MinIO, instala el entorno y arranca el servicio.
+
+------------------------------------------------------------------------------
+MÉTODO 2: SUBIR LOS ARCHIVOS MANUALMENTE POR WINSCP
 ------------------------------------------------------------------------------
 1. Abre WinSCP y conéctate a tu servidor Linux por SFTP/SSH (puerto 22).
 2. Entra a cualquier carpeta (ejemplo: /root o /home/tu_usuario).

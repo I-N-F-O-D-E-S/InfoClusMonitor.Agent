@@ -425,12 +425,13 @@ def browse_directory(target_path):
 # EJECUCIÓN DE COMANDOS Y RESULTADOS
 # =============================================================================
 
-def execute_command(parameters):
+def execute_command_with_code(parameters):
     logger.info("Ejecutando comando en bash: %s", parameters)
     try:
         result = subprocess.run(
             parameters,
             shell=True,
+            executable="/bin/bash" if os.path.exists("/bin/bash") else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -442,11 +443,16 @@ def execute_command(parameters):
 
         output = output.strip() if output.strip() else "(ejecutado sin salida en consola)"
         status = "Completed" if result.returncode == 0 else "Failed"
-        return status, output
+        return status, output, result.returncode
     except subprocess.TimeoutExpired:
-        return "Failed", f"ERROR: Tiempo de espera agotado ({CONFIG['COMMAND_TIMEOUT']}s)"
+        return "Failed", f"ERROR: Tiempo de espera agotado ({CONFIG['COMMAND_TIMEOUT']}s)", -1
     except Exception as e:
-        return "Failed", f"ERROR: {e}"
+        return "Failed", f"ERROR: {e}", -1
+
+
+def execute_command(parameters):
+    status, output, _ = execute_command_with_code(parameters)
+    return status, output
 
 
 def send_result(command_id, status, result_text, agent_id):
@@ -458,6 +464,42 @@ def send_result(command_id, status, result_text, agent_id):
     }
     publish_message_safe(routing_key, payload, delivery_mode=2)
     logger.info("Resultado enviado vía RabbitMQ [%s]: %s -> %s", routing_key, command_id, status)
+
+
+def send_scheduled_execution_result(execution_id, task_id, status, result, error_msg, exit_code, duration_ms, agent_id):
+    routing_key = f"result.{agent_id}"
+    payload = {
+        "commandId": str(execution_id),
+        "executionId": str(execution_id),
+        "taskId": str(task_id),
+        "type": "ScheduledExecutionResult",
+        "status": status,
+        "result": result,
+        "error": error_msg,
+        "exitCode": exit_code,
+        "durationMs": duration_ms
+    }
+    publish_message_safe(routing_key, payload, delivery_mode=2)
+    logger.info("Resultado de tarea programada enviado [%s]: %s -> %s (código: %s, %sms)",
+                routing_key, task_id, status, exit_code, duration_ms)
+
+
+def do_scheduled_command(execution_id, task_id, command, name, agent_id):
+    logger.info("Iniciando ejecución de tarea programada [%s] ('%s'): %s", execution_id, name, command[:120])
+    start_time = time.time()
+    try:
+        status, output_text, exit_code = execute_command_with_code(command)
+        duration_ms = int((time.time() - start_time) * 1000)
+        error_msg = None if status == "Completed" else output_text
+        send_scheduled_execution_result(
+            execution_id, task_id, status, output_text, error_msg, exit_code, duration_ms, agent_id
+        )
+    except Exception as e:
+        duration_ms = int((time.time() - start_time) * 1000)
+        logger.error("Error al ejecutar tarea programada [%s]: %s", execution_id, e)
+        send_scheduled_execution_result(
+            execution_id, task_id, "Failed", None, str(e), -1, duration_ms, agent_id
+        )
 
 
 # =============================================================================
@@ -961,7 +1003,22 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
             ).start()
             return
 
-        # 7. Refresco de telemetría bajo demanda
+        # 7. Ejecutar Tarea Programada (ScheduledCommand)
+        if cmd_type in ("ScheduledCommand", "ScheduledTask"):
+            s_params = parameters if isinstance(parameters, dict) else (json.loads(parameters) if str(parameters).startswith("{") else {})
+            execution_id = s_params.get("executionId", command_id)
+            task_id = s_params.get("taskId", "")
+            cmd_string = s_params.get("command", "")
+            task_name = s_params.get("name", "Tarea Programada")
+
+            threading.Thread(
+                target=do_scheduled_command,
+                args=(execution_id, task_id, cmd_string, task_name, agent_id),
+                daemon=True,
+            ).start()
+            return
+
+        # 8. Refresco de telemetría bajo demanda
         if parameters == "__refresh_telemetry__":
             def run_refresh():
                 logger.info("Petición de refresco de telemetría bajo demanda recibida.")
@@ -972,7 +1029,7 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
             threading.Thread(target=run_refresh, daemon=True).start()
             return
 
-        # 8. Ejecución de comandos Linux bash estándar (Asíncrono en hilo)
+        # 9. Ejecución de comandos Linux bash estándar (Asíncrono en hilo)
         def run_bash_cmd():
             logger.info("Ejecutando comando remoto [%s]: %s", command_id, parameters)
             send_result(command_id, "Running", "", agent_id)

@@ -86,16 +86,35 @@ def main():
         print(f"[ERROR] Error de sintaxis en agent.py: {e}")
         sys.exit(1)
 
-    # 3. Empaquetar en memoria
-    print("\n[3/6] Empaquetando agent.py + install.sh en .tar.gz...")
+    # 3. Empaquetar en memoria (asegurando formato UNIX LF y permisos 755)
+    print("\n[3/6] Empaquetando agent.py + install.sh en .tar.gz (normalizando saltos de linea UNIX LF)...")
+    with open(agent_path, "r", encoding="utf-8", errors="replace") as f:
+        agent_clean_code = f.read().replace("\r\n", "\n").replace("\r", "\n")
+    agent_bytes = agent_clean_code.encode("utf-8")
+
+    with open(install_path, "r", encoding="utf-8", errors="replace") as f:
+        install_clean_code = f.read().replace("\r\n", "\n").replace("\r", "\n")
+    install_bytes = install_clean_code.encode("utf-8")
+
     tar_stream = io.BytesIO()
     with tarfile.open(fileobj=tar_stream, mode="w:gz") as tar:
-        tar.add(agent_path, arcname="agent.py")
-        tar.add(install_path, arcname="install.sh")
+        # agent.py
+        t_agent = tarfile.TarInfo(name="agent.py")
+        t_agent.size = len(agent_bytes)
+        t_agent.mode = 0o755
+        t_agent.mtime = int(datetime.now(timezone.utc).timestamp())
+        tar.addfile(t_agent, io.BytesIO(agent_bytes))
+
+        # install.sh
+        t_install = tarfile.TarInfo(name="install.sh")
+        t_install.size = len(install_bytes)
+        t_install.mode = 0o755
+        t_install.mtime = int(datetime.now(timezone.utc).timestamp())
+        tar.addfile(t_install, io.BytesIO(install_bytes))
 
     tar_bytes = tar_stream.getvalue()
     package_size = len(tar_bytes)
-    print(f"   [OK] Paquete generado: {package_size:,} bytes")
+    print(f"   [OK] Paquete generado limpiamente: {package_size:,} bytes (UNIX LF verificado)")
 
     # Guardar copia local en la raiz
     local_pkg_paths = [

@@ -3,62 +3,91 @@
 =============================================================================
  INFODESCLUSTER AGENT - AGENTE DE MONITOREO, EJECUCIÓN Y RESPALDOS LINUX
 =============================================================================
-- Comunicación 100% AMQP vía RabbitMQ (Sin puertos HTTP expuestos).
+- Comunicación 100% AMQP asíncrona vía RabbitMQ (Sin puertos HTTP expuestos).
 - Monitoreo en tiempo real de CPU, RAM, Disco, Red y Uptime.
-- Explorador remoto de archivos del servidor.
+- Explorador remoto de archivos del servidor con paginación y seguridad.
 - Creación y Restauración ("Carga") de Copias de Seguridad en MinIO S3.
-- Transferencias directas servidor a servidor.
-- Arquitectura no bloqueante multihilo con reconexión automática indestructible.
+- Transferencias directas servidor a servidor con compresión streaming.
+- Tareas programadas con registro de códigos de salida y duración en ms.
+- Arquitectura indestructible multihilo no bloqueante con reconexión automática continua.
 =============================================================================
 """
 
+import datetime
+import hmac
+import hashlib
 import json
+import logging
 import os
 import platform
-import socket
-import subprocess
-import sys
-import time
-import uuid
-import logging
-import threading
+import shutil
 import signal
-import urllib.request
-import urllib.error
+import socket
 import ssl
 import stat
-import datetime
+import subprocess
+import sys
 import tarfile
-import shutil
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 
-import psutil
 import pika
 import pika.exceptions
+import psutil
 
+# Configuración de logging limpio y estructurado
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
 )
 logger = logging.getLogger("InfoClusAgent")
 
+
+def _get_config_env(key, default_val, legacy_keys=None):
+    legacy_keys = legacy_keys or []
+    for k in [key] + legacy_keys:
+        val = os.getenv(k)
+        if val and val not in ("45.10.154.37", "infodes", "SydJqe93jV4o"):
+            return val
+    return default_val
+
+
 CONFIG = {
-    "RABBITMQ_HOST": os.getenv("RABBITMQ_HOST", "45.10.154.37"),
-    "RABBITMQ_PORT": int(os.getenv("RABBITMQ_PORT", "5672")),
-    "RABBITMQ_USER": os.getenv("RABBITMQ_USER", "infodes"),
-    "RABBITMQ_PASS": os.getenv("RABBITMQ_PASS", "SydJqe93jV4o"),
+    "RABBITMQ_HOST": _get_config_env("RABBITMQ_HOST", "173.212.195.170", ["RABBITMQ_HOST_2"]),
+    "RABBITMQ_PORT": int(_get_config_env("RABBITMQ_PORT", "5672", ["RABBITMQ_PORT_2"])),
+    "RABBITMQ_USER": _get_config_env("RABBITMQ_USER", "admin", ["RABBITMQ_USER_2"]),
+    "RABBITMQ_PASS": _get_config_env("RABBITMQ_PASS", "Maca*2023", ["RABBITMQ_PASS_2"]),
     "AGENT_ID_FILE": os.path.expanduser("~/.infoclus_agent_id"),
     "AGENT_VERSION": "1.2.0",
-    "HEARTBEAT_INTERVAL": int(os.getenv("HEARTBEAT_INTERVAL", "15")),
-    "COMMAND_TIMEOUT": int(os.getenv("COMMAND_TIMEOUT", "180")),
+    "HEARTBEAT_INTERVAL": int(_get_config_env("HEARTBEAT_INTERVAL", "15", ["HEARTBEAT_INTERVAL_2"])),
+    "COMMAND_TIMEOUT": int(_get_config_env("COMMAND_TIMEOUT", "300", ["COMMAND_TIMEOUT_2"])),
 }
 
 EXCHANGE = "infoclus.commands"
 
 
 # =============================================================================
-# UTILIDADES DE IDENTIFICACIÓN Y CONEXIÓN
+# UTILIDADES DE CONEXIÓN, SSL E IDENTIFICACIÓN
 # =============================================================================
+
+def _get_ssl_context():
+    """Contexto SSL seguro y tolerante para subidas/descargas directas hacia MinIO S3."""
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    except Exception:
+        try:
+            return ssl._create_unverified_context()
+        except Exception:
+            return None
+
 
 def generate_agent_id():
     machine_id_paths = [
@@ -129,10 +158,15 @@ def _safe_close(conn):
 
 def publish_message_safe(routing_key, body_dict, delivery_mode=2, max_retries=3):
     """
-    Publicador seguro y aislado por hilo para evitar colisiones con canales compartidos.
-    Reintenta automáticamente en caso de micro-cortes de red.
+    Publicador aislado por hilo con conexión propia para evitar condiciones de carrera.
+    Serializa objetos con fallback a string y reintenta ante microcortes.
     """
-    body_json = json.dumps(body_dict)
+    try:
+        body_json = json.dumps(body_dict, default=str)
+    except Exception as e:
+        logger.error("Error al serializar mensaje a JSON para [%s]: %s", routing_key, e)
+        body_json = json.dumps({"error": f"JSON serialization error: {e}"})
+
     for attempt in range(1, max_retries + 1):
         conn = None
         try:
@@ -142,7 +176,7 @@ def publish_message_safe(routing_key, body_dict, delivery_mode=2, max_retries=3)
             ch.basic_publish(
                 exchange=EXCHANGE,
                 routing_key=routing_key,
-                body=body_json,
+                body=body_json.encode("utf-8"),
                 properties=pika.BasicProperties(
                     delivery_mode=delivery_mode,
                     content_type="application/json",
@@ -158,6 +192,117 @@ def publish_message_safe(routing_key, body_dict, delivery_mode=2, max_retries=3)
             else:
                 logger.error("Error al publicar mensaje a [%s] tras %s intentos: %s", routing_key, max_retries, e)
     return False
+
+
+# =============================================================================
+# HTTP RESILIENTE HACIA MINIO S3 (SUBIDAS Y DESCARGAS CON REINTENTOS)
+# =============================================================================
+
+# Códigos HTTP que conviene reintentar (transitorios del lado del servidor/proxy)
+_RETRYABLE_HTTP_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _is_retryable_exception(exc):
+    """True si el error es transitorio (red/SSL/timeout) y vale la pena reintentar."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRYABLE_HTTP_STATUS
+    return isinstance(
+        exc,
+        (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError, ssl.SSLError),
+    )
+
+
+def _sleep_backoff(attempt, label):
+    delay = min(2 ** attempt, 30)
+    logger.warning("[%s] Error transitorio. Reintentando en %ss (intento %s)...", label, delay, attempt)
+    time.sleep(delay)
+
+
+def http_put_file(url, file_path, content_type="application/octet-stream",
+                  timeout=3600, max_retries=5, label="upload"):
+    """
+    Sube un archivo local a una URL mediante PUT, con reintentos y backoff exponencial.
+
+    S3/MinIO trata cada PUT como atómico: si falla, el objeto no queda a medias,
+    por lo que reintentar el archivo completo desde el inicio es seguro.
+    Devuelve el tamaño subido en bytes.
+    """
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            file_size = os.path.getsize(file_path)
+            ctx = _get_ssl_context()
+            kwargs = {"context": ctx} if ctx else {}
+            with open(file_path, "rb") as f:
+                req = urllib.request.Request(url, data=f, method="PUT")
+                req.add_header("Content-Length", str(file_size))
+                req.add_header("Content-Type", content_type)
+                with urllib.request.urlopen(req, timeout=timeout, **kwargs) as response:
+                    if response.status not in (200, 201, 204):
+                        raise urllib.error.HTTPError(
+                            url, response.status, "Estado HTTP inesperado", response.headers, None
+                        )
+            return file_size
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in _RETRYABLE_HTTP_STATUS and attempt < max_retries:
+                _sleep_backoff(attempt, label)
+                continue
+            raise
+        except Exception as e:  # noqa: BLE001 - se decide por reintentabilidad
+            last_err = e
+            if attempt < max_retries and _is_retryable_exception(e):
+                _sleep_backoff(attempt, label)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"[{label}] Subida abortada tras agotar los reintentos.")
+
+
+def http_download_to_file(url, dest_path, timeout=3600, max_retries=5, label="download"):
+    """
+    Descarga una URL mediante GET a un archivo local, reiniciándolo en cada intento
+    y con reintentos ante cortes de red/timeouts. Devuelve el tamaño descargado.
+    """
+    parent_dir = os.path.dirname(os.path.abspath(dest_path)) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            ctx = _get_ssl_context()
+            kwargs = {"context": ctx} if ctx else {}
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout, **kwargs) as resp, open(dest_path, "wb") as out_f:
+                shutil.copyfileobj(resp, out_f, length=128 * 1024)
+            return os.path.getsize(dest_path)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in _RETRYABLE_HTTP_STATUS and attempt < max_retries:
+                _sleep_backoff(attempt, label)
+                continue
+            raise
+        except Exception as e:  # noqa: BLE001 - se decide por reintentabilidad
+            last_err = e
+            if attempt < max_retries and _is_retryable_exception(e):
+                _sleep_backoff(attempt, label)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"[{label}] Descarga abortada tras agotar los reintentos.")
+
+
+def _url_targets_archive(url):
+    """Indica si el objeto apuntado por la URL (ignorando el query string) es un .tar.gz."""
+    try:
+        path = urllib.parse.urlparse(url or "").path.lower()
+    except Exception:
+        path = (url or "").lower()
+    return path.endswith(".tar.gz") or path.endswith(".tgz")
 
 
 # =============================================================================
@@ -227,11 +372,7 @@ def _get_public_ip():
         "https://icanhazip.com",
         "https://checkip.amazonaws.com",
     ]
-    try:
-        ctx = ssl._create_unverified_context()
-    except Exception:
-        ctx = None
-
+    ctx = _get_ssl_context()
     for url in urls:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
@@ -252,21 +393,29 @@ def _get_disk_percent():
     try:
         return psutil.disk_usage("/").percent
     except Exception:
-        return 0.0
+        try:
+            # Fallback a directorio actual
+            return psutil.disk_usage(os.getcwd()).percent
+        except Exception:
+            return 0.0
 
 
 def _get_uptime():
     try:
         return int(time.time() - psutil.boot_time())
     except Exception:
-        return 0
+        try:
+            with open("/proc/uptime", "r") as f:
+                return int(float(f.readline().split()[0]))
+        except Exception:
+            return 0
 
 
 def get_system_stats(agent_id):
     priv_ip = _get_private_ip()
     pub_ip = _get_public_ip()
     try:
-        cpu = psutil.cpu_percent(interval=0.5)
+        cpu = psutil.cpu_percent(interval=0.2)
     except Exception:
         cpu = 0.0
 
@@ -322,17 +471,51 @@ def publish_heartbeat(agent_id):
 
 def heartbeat_worker(agent_id, stop_event):
     """
-    Hilo de telemetría independiente con reconexión persistente.
+    Hilo de telemetría independiente con ejecución reactiva y reconexión continua.
     """
     logger.info("Heartbeat worker iniciado (intervalo: %ss)", CONFIG["HEARTBEAT_INTERVAL"])
     while not stop_event.is_set():
         try:
             publish_heartbeat(agent_id)
         except Exception as e:
-            logger.warning("Error enviando heartbeat: %s", e)
+            logger.warning("Aviso en ciclo de heartbeat: %s", e)
 
-        # Esperar intervalo de forma reactiva a stop_event
+        # Espera reactiva que permite finalizar limpiamente si se detiene el servicio
         stop_event.wait(CONFIG["HEARTBEAT_INTERVAL"])
+
+
+# =============================================================================
+# UTILIDADES DE COMPRESIÓN Y EXTRACCIÓN SEGURA
+# =============================================================================
+
+def _safe_tar_filter(tarinfo):
+    """
+    Filtro de seguridad para empaquetar directorios Linux en .tar.gz:
+    Omite sockets UNIX, FIFOs y nodos especiales para evitar bloqueos.
+    """
+    if tarinfo is None:
+        return None
+    if tarinfo.isreg() or tarinfo.isdir() or tarinfo.issym() or tarinfo.islnk():
+        return tarinfo
+    return None
+
+
+def safe_tar_extract(tar_obj, target_dir):
+    """
+    Extracción segura de archivos .tar.gz resistente a Directory Traversal.
+    Compatible con Python 3.8 a 3.13+.
+    """
+    target_abs = os.path.abspath(target_dir)
+    os.makedirs(target_abs, exist_ok=True)
+
+    if hasattr(tarfile, "data_filter"):
+        tar_obj.extractall(path=target_abs, filter="data")
+    else:
+        for member in tar_obj.getmembers():
+            member_path = os.path.abspath(os.path.join(target_abs, member.name))
+            if not member_path.startswith(target_abs + os.sep) and member_path != target_abs:
+                raise RuntimeError(f"Intento de Directory Traversal detectado en tar: '{member.name}'")
+        tar_obj.extractall(path=target_abs)
 
 
 # =============================================================================
@@ -379,8 +562,16 @@ def browse_directory(target_path):
                     st = entry.stat(follow_symlinks=False)
                     is_dir = entry.is_dir(follow_symlinks=False)
                     size = st.st_size if not is_dir else 0
-                    mode = stat.filemode(st.st_mode)
-                    mod_time = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).isoformat()
+                    try:
+                        mode = stat.filemode(st.st_mode)
+                    except Exception:
+                        mode = "drwxr-xr-x" if is_dir else "-rw-r--r--"
+                    
+                    try:
+                        mod_time = datetime.datetime.fromtimestamp(st.st_mtime, tz=datetime.timezone.utc).isoformat()
+                    except Exception:
+                        mod_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    
                     _, ext = os.path.splitext(entry.name)
 
                     items.append({
@@ -402,7 +593,7 @@ def browse_directory(target_path):
         return {
             "currentPath": target_path,
             "parentPath": parent_path,
-            "items": items[:1000],
+            "items": items[:1500],
             "error": None,
         }
     except PermissionError:
@@ -507,7 +698,6 @@ def do_scheduled_command(execution_id, task_id, command, name, agent_id):
 # =============================================================================
 
 def send_transfer_upload_result(transfer_id, status, size_bytes, error_msg, agent_id):
-    routing_key = f"transfer.upload.{agent_id}"
     payload = {
         "commandId": str(transfer_id),
         "transferId": str(transfer_id),
@@ -516,12 +706,12 @@ def send_transfer_upload_result(transfer_id, status, size_bytes, error_msg, agen
         "sizeBytes": size_bytes,
         "error": error_msg,
     }
-    publish_message_safe(routing_key, payload, delivery_mode=2)
-    logger.info("Resultado de subida de transferencia [%s]: %s -> %s (%s bytes)", routing_key, transfer_id, status, size_bytes)
+    # Publicación única al canal general del backend (evita entrega/uso duplicado)
+    publish_message_safe(f"result.{agent_id}", payload, delivery_mode=2)
+    logger.info("Resultado de subida de transferencia [%s]: %s -> %s (%s bytes)", transfer_id, status, size_bytes)
 
 
 def send_transfer_download_result(transfer_id, status, error_msg, agent_id):
-    routing_key = f"transfer.download.{agent_id}"
     payload = {
         "commandId": str(transfer_id),
         "transferId": str(transfer_id),
@@ -529,20 +719,9 @@ def send_transfer_download_result(transfer_id, status, error_msg, agent_id):
         "status": status,
         "error": error_msg,
     }
-    publish_message_safe(routing_key, payload, delivery_mode=2)
-    logger.info("Resultado de descarga de transferencia [%s]: %s -> %s", routing_key, transfer_id, status)
-
-
-def _safe_tar_filter(tarinfo):
-    """
-    Filtro de seguridad para empaquetar directorios Linux en .tar.gz:
-    Omite sockets UNIX, FIFOs, nodos de dispositivo especiales o sockets de sockets.
-    """
-    if tarinfo is None:
-        return None
-    if tarinfo.isreg() or tarinfo.isdir() or tarinfo.issym() or tarinfo.islnk():
-        return tarinfo
-    return None
+    # Publicación única al canal general del backend (evita entrega/uso duplicado)
+    publish_message_safe(f"result.{agent_id}", payload, delivery_mode=2)
+    logger.info("Resultado de descarga de transferencia [%s]: %s -> %s", transfer_id, status)
 
 
 def do_transfer_upload(transfer_id, source_path, is_directory, upload_url, agent_id):
@@ -567,15 +746,16 @@ def do_transfer_upload(transfer_id, source_path, is_directory, upload_url, agent
             file_to_upload = temp_archive
 
         file_size = os.path.getsize(file_to_upload)
-        logger.info("Subiendo '%s' (%s bytes)...", file_to_upload, file_size)
+        logger.info("Subiendo '%s' (%s bytes) a MinIO con reintentos...", file_to_upload, file_size)
 
-        with open(file_to_upload, "rb") as f:
-            req = urllib.request.Request(upload_url, data=f, method="PUT")
-            req.add_header("Content-Length", str(file_size))
-            req.add_header("Content-Type", "application/octet-stream")
-            with urllib.request.urlopen(req, timeout=1800) as response:
-                if response.status not in (200, 201, 204):
-                    raise RuntimeError(f"Error HTTP en transferencia de subida: status code {response.status}")
+        file_size = http_put_file(
+            upload_url,
+            file_to_upload,
+            content_type="application/octet-stream",
+            timeout=3600,
+            max_retries=5,
+            label=f"transfer-upload:{transfer_id}",
+        )
 
         logger.info("Subida de transferencia [%s] completada exitosamente.", transfer_id)
         send_transfer_upload_result(transfer_id, "Completed", file_size, None, agent_id)
@@ -598,36 +778,26 @@ def do_transfer_download(transfer_id, target_path, is_directory, download_url, a
         target_dir = os.path.dirname(os.path.abspath(target_path))
         os.makedirs(target_dir, exist_ok=True)
 
-        if is_directory or download_url.endswith(".tar.gz") or "tar.gz" in download_url:
+        if is_directory or _url_targets_archive(download_url):
             temp_dir = tempfile.gettempdir()
             temp_download = os.path.join(temp_dir, f"infoclus_dl_{transfer_id}.tar.gz")
-            logger.info("Descargando archivo comprimido a '%s'...", temp_download)
+            logger.info("Descargando archivo comprimido a '%s' (con reintentos)...", temp_download)
 
-            req = urllib.request.Request(download_url, method="GET")
-            with urllib.request.urlopen(req, timeout=1800) as resp, open(temp_download, "wb") as out_f:
-                shutil.copyfileobj(resp, out_f, length=64 * 1024)
+            http_download_to_file(
+                download_url, temp_download, timeout=3600, max_retries=5,
+                label=f"transfer-download:{transfer_id}",
+            )
 
             logger.info("Extrayendo archivo comprimido en '%s'...", target_path)
-            os.makedirs(target_path, exist_ok=True)
-            with tarfile.open(temp_download, "r:gz") as tar:
-                # Sanitización de extracción
-                def is_within_dir(directory, target):
-                    abs_directory = os.path.abspath(directory)
-                    abs_target = os.path.abspath(target)
-                    prefix = os.path.commonprefix([abs_directory, abs_target])
-                    return prefix == abs_directory
-
-                for member in tar.getmembers():
-                    member_path = os.path.join(target_path, member.name)
-                    if not is_within_dir(target_path, member_path):
-                        raise Exception(f"Intento de Directory Traversal detectado: {member.name}")
-                tar.extractall(path=target_path)
+            with tarfile.open(temp_download, "r:*") as tar:
+                safe_tar_extract(tar, target_path)
 
         else:
-            logger.info("Descargando archivo directo a '%s'...", target_path)
-            req = urllib.request.Request(download_url, method="GET")
-            with urllib.request.urlopen(req, timeout=1800) as resp, open(target_path, "wb") as out_f:
-                shutil.copyfileobj(resp, out_f, length=64 * 1024)
+            logger.info("Descargando archivo directo a '%s' (con reintentos)...", target_path)
+            http_download_to_file(
+                download_url, target_path, timeout=3600, max_retries=5,
+                label=f"transfer-download:{transfer_id}",
+            )
 
         logger.info("Descarga y extracción completada con éxito para [%s] en '%s'", transfer_id, target_path)
         send_transfer_download_result(transfer_id, "Completed", None, agent_id)
@@ -691,15 +861,16 @@ def do_prepare_download(download_id, source_path, is_directory, selected_paths, 
             raise FileNotFoundError(f"No se encontró el archivo '{file_to_upload}' para descargar.")
 
         file_size = os.path.getsize(file_to_upload)
-        logger.info("Subiendo descarga [%s] (%s bytes)...", download_id, file_size)
+        logger.info("Subiendo descarga [%s] (%s bytes) a MinIO con reintentos...", download_id, file_size)
 
-        with open(file_to_upload, "rb") as f:
-            req = urllib.request.Request(upload_url, data=f, method="PUT")
-            req.add_header("Content-Length", str(file_size))
-            req.add_header("Content-Type", "application/octet-stream")
-            with urllib.request.urlopen(req, timeout=1800) as response:
-                if response.status not in (200, 201, 204):
-                    raise RuntimeError(f"HTTP error subiendo descarga: {response.status}")
+        file_size = http_put_file(
+            upload_url,
+            file_to_upload,
+            content_type="application/octet-stream",
+            timeout=3600,
+            max_retries=5,
+            label=f"prepare-download:{download_id}",
+        )
 
         logger.info("Descarga lista para [%s] (%s bytes)", download_id, file_size)
         send_prepare_download_result(download_id, "Completed", file_size, None, agent_id)
@@ -768,15 +939,16 @@ def do_create_backup(backup_id, source_path, file_name, upload_url, agent_id):
             raise RuntimeError("Fallo al generar archivo comprimido de copia de seguridad.")
 
         file_size = os.path.getsize(temp_archive)
-        logger.info("Subiendo copia de seguridad [%s] (%s bytes) a MinIO...", backup_id, file_size)
+        logger.info("Subiendo copia de seguridad [%s] (%s bytes) a MinIO con reintentos...", backup_id, file_size)
 
-        with open(temp_archive, "rb") as f:
-            req = urllib.request.Request(upload_url, data=f, method="PUT")
-            req.add_header("Content-Length", str(file_size))
-            req.add_header("Content-Type", "application/gzip")
-            with urllib.request.urlopen(req, timeout=3600) as response:
-                if response.status not in (200, 201, 204):
-                    raise RuntimeError(f"HTTP error subiendo copia a MinIO: status {response.status}")
+        file_size = http_put_file(
+            upload_url,
+            temp_archive,
+            content_type="application/gzip",
+            timeout=7200,
+            max_retries=5,
+            label=f"backup-upload:{backup_id}",
+        )
 
         logger.info("Copia de seguridad [%s] subida exitosamente a MinIO (%s bytes)", backup_id, file_size)
         send_backup_result(backup_id, "Completed", file_size, None, agent_id)
@@ -809,34 +981,18 @@ def do_restore_backup(backup_id, download_url, target_path, file_name, agent_id)
         temp_dir = tempfile.gettempdir()
         temp_download = os.path.join(temp_dir, f"infoclus_restore_{backup_id}.tar.gz")
 
-        logger.info("Descargando archivo de copia de seguridad desde MinIO a '%s'...", temp_download)
-        req = urllib.request.Request(download_url, method="GET")
-        with urllib.request.urlopen(req, timeout=3600) as resp, open(temp_download, "wb") as out_f:
-            shutil.copyfileobj(resp, out_f)
-
-        dl_size = os.path.getsize(temp_download)
+        logger.info("Descargando archivo de copia de seguridad desde MinIO a '%s' (con reintentos)...", temp_download)
+        dl_size = http_download_to_file(
+            download_url, temp_download, timeout=7200, max_retries=5,
+            label=f"backup-restore:{backup_id}",
+        )
         logger.info("Descarga completada (%s bytes). Verificando y extrayendo en '%s'...", dl_size, target_path)
 
         if not tarfile.is_tarfile(temp_download):
             raise RuntimeError("El archivo descargado no es un archivo tar.gz válido o está dañado.")
 
-        # Extracción segura
         with tarfile.open(temp_download, "r:*") as tar:
-            # Prevención de ataques de path traversal '../'
-            def is_within_directory(directory, target):
-                abs_directory = os.path.abspath(directory)
-                abs_target = os.path.abspath(target)
-                prefix = os.path.commonprefix([abs_directory, abs_target])
-                return prefix == abs_directory
-
-            def safe_extract(tar_obj, path=".", members=None, *, numeric_owner=False):
-                for member in (members or tar_obj.getmembers()):
-                    member_path = os.path.join(path, member.name)
-                    if not is_within_directory(path, member_path):
-                        raise Exception(f"Intento de Directory Traversal detectado en el archivo tar: {member.name}")
-                tar_obj.extractall(path, members, numeric_owner=numeric_owner)
-
-            safe_extract(tar, path=target_path)
+            safe_tar_extract(tar, target_path)
 
         logger.info("Copia de seguridad [%s] restaurada/cargada con éxito en '%s'", backup_id, target_path)
         send_restore_backup_result(backup_id, "Completed", target_path, None, agent_id)
@@ -860,7 +1016,7 @@ def do_restore_backup(backup_id, download_url, target_path, file_name, agent_id)
 
 def handle_incoming_message(ch, method, properties, body, agent_id):
     """
-    Recepción asíncrona de mensajes AMQP. Se confirma (ACK) inmediatamente
+    Recepción asíncrona de mensajes AMQP. Se confirma (ACK) de inmediato
     y se delega la ejecución a hilos de trabajo independientes.
     """
     try:
@@ -870,17 +1026,17 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
 
     command_id = None
     try:
-        msg = json.loads(body)
+        msg = json.loads(body.decode("utf-8") if isinstance(body, bytes) else str(body))
         command_id = msg.get("commandId") or msg.get("CommandId") or (properties.message_id if properties else None)
-        cmd_type = msg.get("type") or msg.get("Type") or "Exe"
-        parameters = msg.get("parameters") or msg.get("Parameters") or ""
+        cmd_type = str(msg.get("type") or msg.get("Type") or "Exe").strip()
+        parameters = msg.get("parameters") if "parameters" in msg else msg.get("Parameters", "")
 
         if not command_id:
-            logger.warning("Mensaje recibido sin commandId: %s", body)
-            return
+            command_id = str(uuid.uuid4())
+            logger.warning("Mensaje recibido sin commandId, asignado temporal: %s", command_id)
 
-        # Auto-detección de parámetros si el tipo es genérico
-        if cmd_type in ("Exe", "Command", None, "") and isinstance(parameters, str) and parameters.startswith("{"):
+        # Auto-detección de parámetros si el tipo es genérico o viene serializado
+        if cmd_type in ("Exe", "Command", "Custom", "") and isinstance(parameters, str) and parameters.startswith("{"):
             try:
                 p_parsed = json.loads(parameters)
                 if isinstance(p_parsed, dict):
@@ -893,20 +1049,20 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
                     elif "downloadId" in p_parsed or "selectedPaths" in p_parsed:
                         cmd_type = "PrepareDownload"
                         parameters = p_parsed
-                    elif "uploadUrl" in p_parsed:
+                    elif "uploadUrl" in p_parsed and "transferId" in p_parsed:
                         cmd_type = "TransferUpload"
                         parameters = p_parsed
-                    elif "downloadUrl" in p_parsed:
+                    elif "downloadUrl" in p_parsed and "transferId" in p_parsed:
                         cmd_type = "TransferDownload"
                         parameters = p_parsed
-                    elif "path" in p_parsed:
+                    elif "path" in p_parsed and len(p_parsed) <= 3:
                         cmd_type = "BrowseFiles"
                         parameters = p_parsed
             except Exception:
                 pass
 
         # 1. Explorador de archivos
-        if cmd_type == "BrowseFiles":
+        if cmd_type in ("BrowseFiles", "BrowseDirectory"):
             path_to_browse = "/"
             if isinstance(parameters, dict):
                 path_to_browse = parameters.get("path", "/")
@@ -920,9 +1076,19 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
                 path_to_browse = parameters
 
             def run_browse():
-                logger.info("Explorando directorio remoto [%s]: '%s'", command_id, path_to_browse)
-                browse_result = browse_directory(path_to_browse)
-                send_result(command_id, "Completed", json.dumps(browse_result), agent_id)
+                try:
+                    logger.info("Explorando directorio remoto [%s]: '%s'", command_id, path_to_browse)
+                    browse_result = browse_directory(path_to_browse)
+                    res_json = json.dumps(browse_result, default=str)
+                    send_result(command_id, "Completed", res_json, agent_id)
+                    publish_message_safe(f"filebrowse.{agent_id}", {
+                        "commandId": str(command_id),
+                        "type": "BrowseFilesResult",
+                        "result": res_json
+                    }, delivery_mode=2)
+                except Exception as ex:
+                    logger.error("Error en explorador de archivos [%s]: %s", command_id, ex)
+                    send_result(command_id, "Failed", json.dumps({"error": str(ex)}), agent_id)
 
             threading.Thread(target=run_browse, daemon=True).start()
             return
@@ -958,7 +1124,7 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
             return
 
         # 4. Preparación de descarga directa al navegador
-        if cmd_type == "PrepareDownload":
+        if cmd_type in ("PrepareDownload", "DownloadFile", "DownloadDirectory"):
             p_params = parameters if isinstance(parameters, dict) else (json.loads(parameters) if str(parameters).startswith("{") else {})
             download_id = p_params.get("downloadId", command_id)
             source_path = p_params.get("sourcePath", "")
@@ -1021,21 +1187,29 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
         # 8. Refresco de telemetría bajo demanda
         if parameters == "__refresh_telemetry__":
             def run_refresh():
-                logger.info("Petición de refresco de telemetría bajo demanda recibida.")
-                send_result(command_id, "Running", "", agent_id)
-                publish_heartbeat(agent_id)
-                send_result(command_id, "Completed", "Telemetría actualizada en tiempo real.", agent_id)
+                try:
+                    logger.info("Petición de refresco de telemetría bajo demanda recibida.")
+                    send_result(command_id, "Running", "", agent_id)
+                    publish_heartbeat(agent_id)
+                    send_result(command_id, "Completed", "Telemetría actualizada en tiempo real.", agent_id)
+                except Exception as ex:
+                    send_result(command_id, "Failed", str(ex), agent_id)
 
             threading.Thread(target=run_refresh, daemon=True).start()
             return
 
         # 9. Ejecución de comandos Linux bash estándar (Asíncrono en hilo)
         def run_bash_cmd():
-            logger.info("Ejecutando comando remoto [%s]: %s", command_id, parameters)
-            send_result(command_id, "Running", "", agent_id)
-            status, result_text = execute_command(parameters)
-            send_result(command_id, status, result_text, agent_id)
-            logger.info("Comando [%s] finalizado (%s): %s", command_id, status, result_text[:100])
+            try:
+                cmd_to_run = parameters if isinstance(parameters, str) else json.dumps(parameters)
+                logger.info("Ejecutando comando remoto [%s]: %s", command_id, cmd_to_run)
+                send_result(command_id, "Running", "", agent_id)
+                status, result_text = execute_command(cmd_to_run)
+                send_result(command_id, status, result_text, agent_id)
+                logger.info("Comando [%s] finalizado (%s): %s", command_id, status, result_text[:120])
+            except Exception as ex:
+                logger.error("Error ejecutando comando bash [%s]: %s", command_id, ex)
+                send_result(command_id, "Failed", f"Error de ejecución: {ex}", agent_id)
 
         threading.Thread(target=run_bash_cmd, daemon=True).start()
 
@@ -1043,7 +1217,7 @@ def handle_incoming_message(ch, method, properties, body, agent_id):
         logger.error("Error al procesar mensaje de comando: %s", e)
         if command_id:
             try:
-                send_result(command_id, "Failed", str(e), agent_id)
+                send_result(command_id, "Failed", f"Error procesando mensaje: {e}", agent_id)
             except Exception:
                 pass
 
@@ -1073,7 +1247,8 @@ def main():
     )
     heartbeat_thread.start()
 
-    retry_delay = 5
+    retry_delay = 3
+    max_retry_delay = 30
 
     while not stop_event.is_set():
         conn = None
@@ -1086,12 +1261,12 @@ def main():
                 exchange=EXCHANGE, exchange_type="topic", durable=True
             )
 
-            # Publicar registro inicial del nodo
+            # Publicar registro inicial del nodo en cada reconexión exitosa
             publish_registration(agent_id)
 
             queue_name = f"agent-{agent_id}"
             channel.queue_declare(
-                queue=queue_name, durable=True, auto_delete=True
+                queue=queue_name, durable=True, auto_delete=False
             )
             channel.queue_bind(
                 queue=queue_name,
@@ -1101,6 +1276,9 @@ def main():
             channel.basic_qos(prefetch_count=1)
 
             logger.info("Escuchando comandos en cola: '%s' [routing_key: command.%s]", queue_name, agent_id)
+
+            # Reiniciar delay al conectarse exitosamente
+            retry_delay = 3
 
             channel.basic_consume(
                 queue=queue_name,
@@ -1116,15 +1294,16 @@ def main():
                 pika.exceptions.StreamLostError, pika.exceptions.ChannelClosedByBroker,
                 pika.exceptions.ConnectionClosedByBroker, socket.error, OSError) as e:
             if not stop_event.is_set():
-                logger.warning("Conexión con RabbitMQ perdida o no disponible (%s). Reintentando en %ss de forma continua...", e, retry_delay)
+                logger.warning("Conexión con RabbitMQ perdida o no disponible (%s). Reintentando en %ss...", e, retry_delay)
         except Exception as e:
             if not stop_event.is_set():
-                logger.error("Error en bucle de RabbitMQ (%s). Reintentando en %ss...", e, retry_delay)
+                logger.error("Error inesperado en bucle de RabbitMQ (%s). Reintentando en %ss...", e, retry_delay)
         finally:
             _safe_close(conn)
 
         if not stop_event.is_set():
             stop_event.wait(retry_delay)
+            retry_delay = min(int(retry_delay * 1.5), max_retry_delay)
 
     logger.info("InfoClus Agent se detuvo correctamente.")
 
